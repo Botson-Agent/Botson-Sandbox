@@ -23,13 +23,13 @@ A standalone Go module providing a **gVisor-backed sandbox execution environment
 ## Install
 
 ```bash
-go get github.com/xSaVageAU/botson-sandbox@latest
+go get github.com/Botson-Agent/Botson-Sandbox@latest
 ```
 
 ## Usage
 
 ```go
-import "github.com/xSaVageAU/botson-sandbox/sandbox"
+import "github.com/Botson-Agent/Botson-Sandbox/sandbox"
 
 // Create a rootfs manager pointing at your cache dir
 rm := sandbox.NewRootfsManager("/home/user/.botson-agent/cache")

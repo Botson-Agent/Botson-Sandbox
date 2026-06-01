@@ -1,4 +1,4 @@
-module github.com/xSaVageAU/botson-sandbox
+module github.com/Botson-Agent/Botson-Sandbox
 
 go 1.25.0
 
