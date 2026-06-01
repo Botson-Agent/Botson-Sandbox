@@ -1,0 +1,535 @@
+package sandbox
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+)
+
+type NetworkMode string
+
+const (
+	NetworkDefault      NetworkMode = "default"      // Maps to unrestricted (allows internet access)
+	NetworkIsolated     NetworkMode = "isolated"     // No network access at all (none)
+	NetworkUnrestricted NetworkMode = "unrestricted" // Full access (host)
+)
+
+type Sandbox struct {
+	ID           string
+	BundlePath   string
+	RootfsPath   string
+	StatePath    string
+	RootfsMgr    *RootfsManager
+	Cmd          *exec.Cmd // Store the running daemon background process
+	NetMode      NetworkMode
+	TemplateName string
+	Persist      bool
+}
+
+// NewSandbox initializes a new sandboxed environment with a unique ID and bootstrapped rootfs
+func NewSandbox(rootfsMgr *RootfsManager, templateName string) (*Sandbox, error) {
+	// Generate unique 8-character hex ID
+	bytes := make([]byte, 4)
+	if _, err := rand.Read(bytes); err != nil {
+		return nil, fmt.Errorf("failed to generate random ID: %w", err)
+	}
+	id := "gvis-term-" + hex.EncodeToString(bytes)
+
+	// Setup temporary paths in /tmp (standard writable Linux directory)
+	tempBase := os.TempDir()
+	bundlePath := filepath.Join(tempBase, id)
+	rootfsPath := filepath.Join(bundlePath, "rootfs")
+	statePath := filepath.Join(tempBase, id+"-state")
+
+	s := &Sandbox{
+		ID:           id,
+		BundlePath:   bundlePath,
+		RootfsPath:   rootfsPath,
+		StatePath:    statePath,
+		RootfsMgr:    rootfsMgr,
+		TemplateName: templateName,
+	}
+
+	// 1. Create directories
+	if err := os.MkdirAll(rootfsPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create sandbox directories: %w", err)
+	}
+	if err := os.MkdirAll(statePath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create state directory: %w", err)
+	}
+
+	// 2. Bootstrap rootfs into bundle
+	if templateName != "" {
+		if err := rootfsMgr.CopyCustomTemplateTo(templateName, rootfsPath); err != nil {
+			s.Cleanup()
+			return nil, fmt.Errorf("failed to copy custom template: %w", err)
+		}
+	} else {
+		if err := rootfsMgr.CopyTemplateTo(rootfsPath); err != nil {
+			s.Cleanup()
+			return nil, fmt.Errorf("failed to copy template rootfs: %w", err)
+		}
+	}
+
+	// 2.5 Setup DNS resolution (/etc/resolv.conf) inside rootfs
+	resolvConfPath := filepath.Join(rootfsPath, "etc", "resolv.conf")
+	if hostResolv, err := os.ReadFile("/etc/resolv.conf"); err == nil && len(hostResolv) > 0 {
+		_ = os.WriteFile(resolvConfPath, hostResolv, 0644)
+	} else {
+		// Fallback to public DNS if host's resolv.conf is unreadable or empty
+		defaultDNS := []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+		_ = os.WriteFile(resolvConfPath, defaultDNS, 0644)
+	}
+
+	// 3. Beautify rootfs shell configuration (profile, aliases, color support)
+	profileDir := filepath.Join(rootfsPath, "etc", "profile.d")
+	if err := os.MkdirAll(profileDir, 0755); err == nil {
+		colorScript := `alias ls='ls --color=auto'
+alias ll='ls -la --color=auto'
+alias grep='grep --color=auto'
+alias egrep='egrep --color=auto'
+alias fgrep='fgrep --color=auto'
+`
+		_ = os.WriteFile(filepath.Join(profileDir, "color.sh"), []byte(colorScript), 0644)
+	}
+
+	return s, nil
+}
+
+// NewSessionSandbox initializes a persistent named sandbox session
+func NewSessionSandbox(rootfsMgr *RootfsManager, sessionID string, templateName string, persist bool) (*Sandbox, error) {
+	// Setup temporary paths for OCI bundle and state in /tmp
+	tempBase := os.TempDir()
+	bundlePath := filepath.Join(tempBase, sessionID)
+	statePath := filepath.Join(tempBase, sessionID+"-state")
+
+	// Determine persistent rootfs workspace directory
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("failed to locate home directory: %w", err)
+	}
+	rootfsPath := filepath.Join(home, ".botson-agent", "sessions", sessionID, "workspace")
+
+	s := &Sandbox{
+		ID:           sessionID,
+		BundlePath:   bundlePath,
+		RootfsPath:   rootfsPath,
+		StatePath:    statePath,
+		RootfsMgr:    rootfsMgr,
+		TemplateName: templateName,
+		Persist:      persist,
+	}
+
+	// Clean up any residual daemon configs/states in /tmp before booting to ensure a clean slate
+	_ = os.RemoveAll(bundlePath)
+	_ = os.RemoveAll(statePath)
+
+	// 1. Create directories
+	if err := os.MkdirAll(rootfsPath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create sandbox rootfs: %w", err)
+	}
+	if err := os.MkdirAll(bundlePath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create bundle directory: %w", err)
+	}
+	if err := os.MkdirAll(statePath, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create state directory: %w", err)
+	}
+
+	// 2. Bootstrap rootfs if it is empty (has no /bin directory)
+	if _, err := os.Stat(filepath.Join(rootfsPath, "bin")); os.IsNotExist(err) {
+		if templateName != "" {
+			if err := rootfsMgr.CopyCustomTemplateTo(templateName, rootfsPath); err != nil {
+				s.Cleanup()
+				return nil, fmt.Errorf("failed to copy custom template: %w", err)
+			}
+		} else {
+			if err := rootfsMgr.CopyTemplateTo(rootfsPath); err != nil {
+				s.Cleanup()
+				return nil, fmt.Errorf("failed to copy template rootfs: %w", err)
+			}
+		}
+
+		// 2.5 Setup DNS resolution (/etc/resolv.conf) inside rootfs
+		resolvConfPath := filepath.Join(rootfsPath, "etc", "resolv.conf")
+		if hostResolv, err := os.ReadFile("/etc/resolv.conf"); err == nil && len(hostResolv) > 0 {
+			_ = os.WriteFile(resolvConfPath, hostResolv, 0644)
+		} else {
+			defaultDNS := []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+			_ = os.WriteFile(resolvConfPath, defaultDNS, 0644)
+		}
+
+		// 3. Beautify rootfs shell configuration
+		profileDir := filepath.Join(rootfsPath, "etc", "profile.d")
+		if err := os.MkdirAll(profileDir, 0755); err == nil {
+			colorScript := `alias ls='ls --color=auto'
+alias ll='ls -la --color=auto'
+alias grep='grep --color=auto'
+alias egrep='egrep --color=auto'
+alias fgrep='fgrep --color=auto'
+`
+			_ = os.WriteFile(filepath.Join(profileDir, "color.sh"), []byte(colorScript), 0644)
+		}
+	}
+
+	return s, nil
+}
+
+// Run executes a command inside the sandbox and blocks until completion
+func (s *Sandbox) Run(args []string, isTerminal bool, netMode NetworkMode) error {
+	if netMode == NetworkDefault {
+		netMode = NetworkUnrestricted
+	}
+	s.NetMode = netMode
+
+	// Ensure runsc is installed and accessible
+	runscPath, err := exec.LookPath("runsc")
+	if err != nil {
+		return fmt.Errorf("gVisor 'runsc' command not found. Please install runsc (see README.md for instructions)")
+	}
+	// Clean up any lingering gVisor filestore files to prevent overlay mount conflict errors
+	s.CleanFilestores()
+	// Write OCI config.json
+	cfg := DefaultOCIConfig(args, isTerminal)
+	cfg.Root.Path = s.RootfsPath
+
+	// Network isolation configuration
+	if netMode != NetworkIsolated {
+		// Remove the network namespace to share the host's network namespace.
+		var newNamespaces []Namespace
+		for _, ns := range cfg.Linux.Namespaces {
+			if ns.Type != "network" {
+				newNamespaces = append(newNamespaces, ns)
+			}
+		}
+		cfg.Linux.Namespaces = newNamespaces
+	}
+
+	if err := WriteConfig(s.BundlePath, cfg); err != nil {
+		return fmt.Errorf("failed to write OCI config: %w", err)
+	}
+
+	runscArgs := []string{
+		"--root", s.StatePath,
+		"--ignore-cgroups",
+		"--rootless",
+		"--overlay2", "none",
+	}
+
+	if netMode == NetworkIsolated {
+		runscArgs = append(runscArgs, "--network", "none")
+	} else {
+		runscArgs = append(runscArgs, "--network", "host")
+	}
+
+	runscArgs = append(runscArgs, "run", "--bundle", s.BundlePath, s.ID)
+
+	cmd := exec.Command(runscPath, runscArgs...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Start execution
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start gVisor sandbox process: %w", err)
+	}
+
+	// Wait for completion
+	err = cmd.Wait()
+	if err != nil {
+		// Check exit code
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("sandbox process exited with non-zero code: %d", exitError.ExitCode())
+		}
+		return fmt.Errorf("sandbox execution error: %w", err)
+	}
+
+	return nil
+}
+
+// CleanFilestores sweeps any residual gVisor overlay filestore metadata files from the rootfs mount source
+func (s *Sandbox) CleanFilestores() {
+	pattern := filepath.Join(s.RootfsPath, ".gvisor.filestore.*")
+	matches, err := filepath.Glob(pattern)
+	if err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
+}
+
+// Cleanup removes all temporary bundle directories and state folders created for this sandbox instance
+func (s *Sandbox) Cleanup() {
+	if s.BundlePath != "" {
+		_ = os.RemoveAll(s.BundlePath)
+	}
+	if s.StatePath != "" {
+		_ = os.RemoveAll(s.StatePath)
+	}
+}
+
+// StartDaemon starts a persistent, long-running sandbox session in the background
+func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
+	if netMode == NetworkDefault {
+		netMode = NetworkUnrestricted
+	}
+	s.NetMode = netMode
+
+	if s.Persist {
+		meta := struct {
+			ID           string      `json:"id"`
+			Persist      bool        `json:"persist"`
+			TemplateName string      `json:"template_name"`
+			NetMode      NetworkMode `json:"net_mode"`
+		}{
+			ID:           s.ID,
+			Persist:      true,
+			TemplateName: s.TemplateName,
+			NetMode:      netMode,
+		}
+		metaData, _ := json.MarshalIndent(meta, "", "  ")
+		_ = os.WriteFile(filepath.Join(filepath.Dir(s.RootfsPath), "meta.json"), metaData, 0644)
+	}
+
+	runscPath, err := exec.LookPath("runsc")
+	if err != nil {
+		return fmt.Errorf("gVisor 'runsc' command not found")
+	}
+	// Clean up any lingering gVisor filestore files to prevent overlay mount conflict errors
+	s.CleanFilestores()
+
+	// Determine the startup command for the background daemon
+	daemonCmd := []string{"/bin/sleep", "31536000"}
+
+	// For a background daemon, we write a config that runs the startup command
+	cfg := DefaultOCIConfig(daemonCmd, false)
+	cfg.Root.Path = s.RootfsPath
+
+	if netMode != NetworkIsolated {
+		// Remove the network namespace to share the host's network namespace.
+		var newNamespaces []Namespace
+		for _, ns := range cfg.Linux.Namespaces {
+			if ns.Type != "network" {
+				newNamespaces = append(newNamespaces, ns)
+			}
+		}
+		cfg.Linux.Namespaces = newNamespaces
+	}
+
+	if err := WriteConfig(s.BundlePath, cfg); err != nil {
+		return fmt.Errorf("failed to write OCI config: %w", err)
+	}
+
+	runscArgs := []string{
+		"--root", s.StatePath,
+		"--ignore-cgroups",
+		"--rootless",
+		"--overlay2", "none",
+	}
+
+	if netMode == NetworkIsolated {
+		runscArgs = append(runscArgs, "--network", "none")
+	} else {
+		runscArgs = append(runscArgs, "--network", "host")
+	}
+
+	runscArgs = append(runscArgs, "run", "--bundle", s.BundlePath, s.ID)
+
+	cmd := exec.Command(runscPath, runscArgs...)
+	s.Cmd = cmd
+
+	// Capture stdout and stderr of the background daemon process for diagnostics
+	logPath := filepath.Join(s.BundlePath, "daemon.log")
+	logFile, err := os.Create(logPath)
+	if err == nil {
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	}
+
+	// Start execution in the background
+	if err := cmd.Start(); err != nil {
+		if logFile != nil {
+			logFile.Close()
+		}
+		return fmt.Errorf("failed to start gVisor daemon: %w", err)
+	}
+
+	return nil
+}
+
+// Exec injects and runs a command inside the running sandbox daemon, returning stdout, stderr, and the exit code
+func (s *Sandbox) Exec(command string) (string, string, int, error) {
+	runscPath, err := exec.LookPath("runsc")
+	if err != nil {
+		return "", "", -1, fmt.Errorf("gVisor 'runsc' command not found")
+	}
+
+	// We use runsc exec with the identical global rootless flags
+	runscArgs := []string{
+		"--root", s.StatePath,
+		"--ignore-cgroups",
+		"--rootless",
+		"exec", s.ID,
+		"/bin/sh", "-c", command,
+	}
+
+	cmd := exec.Command(runscPath, runscArgs...)
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err = cmd.Run()
+	stdout := stdoutBuf.String()
+	stderr := stderrBuf.String()
+
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return stdout, stderr, exitError.ExitCode(), nil
+		}
+		return stdout, stderr, -1, err
+	}
+
+	return stdout, stderr, 0, nil
+}
+
+// WriteFile writes a file directly into the sandbox guest workspace at microsecond-level speeds
+func (s *Sandbox) WriteFile(path string, content []byte, perm os.FileMode) error {
+	target := filepath.Join(s.RootfsPath, filepath.Clean(path))
+
+	// Ensure parent directory exists inside container
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(target, content, perm)
+}
+
+// ReadFile reads a file directly from the sandbox guest workspace
+func (s *Sandbox) ReadFile(path string) ([]byte, error) {
+	target := filepath.Join(s.RootfsPath, filepath.Clean(path))
+	return os.ReadFile(target)
+}
+
+// Close terminates the running background daemon and safely sweeps away all temporary bundle files
+func (s *Sandbox) Close() error {
+	if s.Cmd != nil && s.Cmd.Process != nil {
+		_ = s.Cmd.Process.Kill()
+		_ = s.Cmd.Wait()
+	}
+	s.Cleanup()
+	if !s.Persist && s.ID != "default-sandbox" {
+		// Clean up the entire session folder for ephemeral custom sandboxes
+		sessionDir := filepath.Dir(s.RootfsPath)
+		_ = os.RemoveAll(sessionDir)
+	}
+	return nil
+}
+
+// ResetWorkspace stops the running sandbox sentry, wipes the workspace, re-copies the original template, and restarts the sentry.
+func (s *Sandbox) ResetWorkspace() error {
+	// 1. Stop daemon cleanly if running
+	if s.Cmd != nil && s.Cmd.Process != nil {
+		_ = s.Cmd.Process.Kill()
+		_ = s.Cmd.Wait()
+		s.Cmd = nil
+	}
+
+	// 2. Wipe the workspace directory
+	_ = os.RemoveAll(s.RootfsPath)
+	if err := os.MkdirAll(s.RootfsPath, 0755); err != nil {
+		return fmt.Errorf("failed to recreate workspace directory: %w", err)
+	}
+
+	// 3. Re-copy the original template rootfs
+	if s.TemplateName != "" {
+		if err := s.RootfsMgr.CopyCustomTemplateTo(s.TemplateName, s.RootfsPath); err != nil {
+			return fmt.Errorf("failed to copy custom template: %w", err)
+		}
+	} else {
+		if err := s.RootfsMgr.CopyTemplateTo(s.RootfsPath); err != nil {
+			return fmt.Errorf("failed to copy standard rootfs: %w", err)
+		}
+	}
+
+	// 3.5 Setup DNS resolution (/etc/resolv.conf) inside rootfs
+	resolvConfPath := filepath.Join(s.RootfsPath, "etc", "resolv.conf")
+	if hostResolv, err := os.ReadFile("/etc/resolv.conf"); err == nil && len(hostResolv) > 0 {
+		_ = os.WriteFile(resolvConfPath, hostResolv, 0644)
+	} else {
+		defaultDNS := []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+		_ = os.WriteFile(resolvConfPath, defaultDNS, 0644)
+	}
+
+	// 4. Beautify rootfs shell configuration
+	profileDir := filepath.Join(s.RootfsPath, "etc", "profile.d")
+	if err := os.MkdirAll(profileDir, 0755); err == nil {
+		colorScript := `alias ls='ls --color=auto'
+alias ll='ls -la --color=auto'
+alias grep='grep --color=auto'
+alias egrep='egrep --color=auto'
+alias fgrep='fgrep --color=auto'
+`
+		_ = os.WriteFile(filepath.Join(profileDir, "color.sh"), []byte(colorScript), 0644)
+	}
+
+	// 5. Restart the daemon!
+	return s.StartDaemon(s.NetMode)
+}
+
+// LoadPersistentSessions scans the sessions directory on the host and automatically instantiates persistent sandboxes
+func LoadPersistentSessions(rootfsMgr *RootfsManager) ([]*Sandbox, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	sessionsDir := filepath.Join(home, ".botson-agent", "sessions")
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var loaded []*Sandbox
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		sessionID := entry.Name()
+		if sessionID == "default-sandbox" {
+			continue // Handled separately by main startup
+		}
+
+		metaPath := filepath.Join(sessionsDir, sessionID, "meta.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+
+		var meta struct {
+			ID           string      `json:"id"`
+			Persist      bool        `json:"persist"`
+			TemplateName string      `json:"template_name"`
+			NetMode      NetworkMode `json:"net_mode"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+
+		if meta.Persist {
+			sb, err := NewSessionSandbox(rootfsMgr, sessionID, meta.TemplateName, true)
+			if err == nil {
+				sb.NetMode = meta.NetMode
+				loaded = append(loaded, sb)
+			}
+		}
+	}
+	return loaded, nil
+}
+
