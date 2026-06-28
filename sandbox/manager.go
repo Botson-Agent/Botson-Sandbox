@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 type NetworkMode string
@@ -18,6 +20,8 @@ const (
 	NetworkIsolated     NetworkMode = "isolated"     // No network access at all (none)
 	NetworkUnrestricted NetworkMode = "unrestricted" // Full access (host)
 )
+
+var WSLDistro = "botson-sandbox"
 
 type Sandbox struct {
 	ID           string
@@ -187,15 +191,50 @@ func (s *Sandbox) Run(args []string, isTerminal bool, netMode NetworkMode) error
 	s.NetMode = netMode
 
 	// Ensure runsc is installed and accessible
-	runscPath, err := exec.LookPath("runsc")
-	if err != nil {
-		return fmt.Errorf("gVisor 'runsc' command not found. Please install runsc (see README.md for instructions)")
+	runscPath := "runsc"
+	if runtime.GOOS == "windows" {
+		_, err := exec.LookPath("wsl")
+		if err != nil {
+			return fmt.Errorf("WSL 'wsl' command not found. WSL is required on Windows to run gVisor sandboxes")
+		}
+		whichCmd := exec.Command("wsl", "-d", WSLDistro, "which", "runsc")
+		if err := whichCmd.Run(); err != nil {
+			return fmt.Errorf("gVisor 'runsc' command not found inside WSL. Please run 'botson wslsetup' to configure the %q WSL distribution", WSLDistro)
+		}
+		runscPath = "wsl"
+	} else {
+		var err error
+		runscPath, err = exec.LookPath("runsc")
+		if err != nil {
+			return fmt.Errorf("gVisor 'runsc' command not found. Please install runsc (see README.md for instructions)")
+		}
 	}
+
+	statePath := s.StatePath
+	bundlePath := s.BundlePath
+	rootfsPath := s.RootfsPath
+
+	if runtime.GOOS == "windows" {
+		var err error
+		statePath, err = translateToWSLPath(s.StatePath)
+		if err != nil {
+			return fmt.Errorf("failed to translate StatePath to WSL: %w", err)
+		}
+		bundlePath, err = translateToWSLPath(s.BundlePath)
+		if err != nil {
+			return fmt.Errorf("failed to translate BundlePath to WSL: %w", err)
+		}
+		rootfsPath, err = translateToWSLPath(s.RootfsPath)
+		if err != nil {
+			return fmt.Errorf("failed to translate RootfsPath to WSL: %w", err)
+		}
+	}
+
 	// Clean up any lingering gVisor filestore files to prevent overlay mount conflict errors
 	s.CleanFilestores()
 	// Write OCI config.json
 	cfg := DefaultOCIConfig(args, isTerminal)
-	cfg.Root.Path = s.RootfsPath
+	cfg.Root.Path = rootfsPath
 
 	// Network isolation configuration
 	if netMode != NetworkIsolated {
@@ -214,7 +253,7 @@ func (s *Sandbox) Run(args []string, isTerminal bool, netMode NetworkMode) error
 	}
 
 	runscArgs := []string{
-		"--root", s.StatePath,
+		"--root", statePath,
 		"--ignore-cgroups",
 		"--rootless",
 		"--overlay2", "none",
@@ -226,9 +265,15 @@ func (s *Sandbox) Run(args []string, isTerminal bool, netMode NetworkMode) error
 		runscArgs = append(runscArgs, "--network", "host")
 	}
 
-	runscArgs = append(runscArgs, "run", "--bundle", s.BundlePath, s.ID)
+	runscArgs = append(runscArgs, "run", "--bundle", bundlePath, s.ID)
 
-	cmd := exec.Command(runscPath, runscArgs...)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		wslArgs := append([]string{"-d", WSLDistro, "runsc"}, runscArgs...)
+		cmd = exec.Command("wsl", wslArgs...)
+	} else {
+		cmd = exec.Command(runscPath, runscArgs...)
+	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -239,8 +284,7 @@ func (s *Sandbox) Run(args []string, isTerminal bool, netMode NetworkMode) error
 	}
 
 	// Wait for completion
-	err = cmd.Wait()
-	if err != nil {
+	if err := cmd.Wait(); err != nil {
 		// Check exit code
 		if exitError, ok := err.(*exec.ExitError); ok {
 			return fmt.Errorf("sandbox process exited with non-zero code: %d", exitError.ExitCode())
@@ -295,10 +339,45 @@ func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 		_ = os.WriteFile(filepath.Join(filepath.Dir(s.RootfsPath), "meta.json"), metaData, 0644)
 	}
 
-	runscPath, err := exec.LookPath("runsc")
-	if err != nil {
-		return fmt.Errorf("gVisor 'runsc' command not found")
+	runscPath := "runsc"
+	if runtime.GOOS == "windows" {
+		_, err := exec.LookPath("wsl")
+		if err != nil {
+			return fmt.Errorf("WSL 'wsl' command not found. WSL is required on Windows to run gVisor sandboxes")
+		}
+		whichCmd := exec.Command("wsl", "-d", WSLDistro, "which", "runsc")
+		if err := whichCmd.Run(); err != nil {
+			return fmt.Errorf("gVisor 'runsc' command not found inside WSL. Please run 'botson wslsetup' to configure the %q WSL distribution", WSLDistro)
+		}
+		runscPath = "wsl"
+	} else {
+		var err error
+		runscPath, err = exec.LookPath("runsc")
+		if err != nil {
+			return fmt.Errorf("gVisor 'runsc' command not found")
+		}
 	}
+
+	statePath := s.StatePath
+	bundlePath := s.BundlePath
+	rootfsPath := s.RootfsPath
+
+	if runtime.GOOS == "windows" {
+		var err error
+		statePath, err = translateToWSLPath(s.StatePath)
+		if err != nil {
+			return fmt.Errorf("failed to translate StatePath to WSL: %w", err)
+		}
+		bundlePath, err = translateToWSLPath(s.BundlePath)
+		if err != nil {
+			return fmt.Errorf("failed to translate BundlePath to WSL: %w", err)
+		}
+		rootfsPath, err = translateToWSLPath(s.RootfsPath)
+		if err != nil {
+			return fmt.Errorf("failed to translate RootfsPath to WSL: %w", err)
+		}
+	}
+
 	// Clean up any lingering gVisor filestore files to prevent overlay mount conflict errors
 	s.CleanFilestores()
 
@@ -307,7 +386,7 @@ func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 
 	// For a background daemon, we write a config that runs the startup command
 	cfg := DefaultOCIConfig(daemonCmd, false)
-	cfg.Root.Path = s.RootfsPath
+	cfg.Root.Path = rootfsPath
 
 	if netMode != NetworkIsolated {
 		// Remove the network namespace to share the host's network namespace.
@@ -325,7 +404,7 @@ func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 	}
 
 	runscArgs := []string{
-		"--root", s.StatePath,
+		"--root", statePath,
 		"--ignore-cgroups",
 		"--rootless",
 		"--overlay2", "none",
@@ -337,9 +416,15 @@ func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 		runscArgs = append(runscArgs, "--network", "host")
 	}
 
-	runscArgs = append(runscArgs, "run", "--bundle", s.BundlePath, s.ID)
+	runscArgs = append(runscArgs, "run", "--bundle", bundlePath, s.ID)
 
-	cmd := exec.Command(runscPath, runscArgs...)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		wslArgs := append([]string{"-d", WSLDistro, "runsc"}, runscArgs...)
+		cmd = exec.Command("wsl", wslArgs...)
+	} else {
+		cmd = exec.Command(runscPath, runscArgs...)
+	}
 	s.Cmd = cmd
 
 	// Capture stdout and stderr of the background daemon process for diagnostics
@@ -363,27 +448,52 @@ func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 
 // Exec injects and runs a command inside the running sandbox daemon, returning stdout, stderr, and the exit code
 func (s *Sandbox) Exec(command string) (string, string, int, error) {
-	runscPath, err := exec.LookPath("runsc")
-	if err != nil {
-		return "", "", -1, fmt.Errorf("gVisor 'runsc' command not found")
+	runscPath := "runsc"
+	if runtime.GOOS == "windows" {
+		_, err := exec.LookPath("wsl")
+		if err != nil {
+			return "", "", -1, fmt.Errorf("WSL 'wsl' command not found")
+		}
+		runscPath = "wsl"
+	} else {
+		var err error
+		runscPath, err = exec.LookPath("runsc")
+		if err != nil {
+			return "", "", -1, fmt.Errorf("gVisor 'runsc' command not found")
+		}
+	}
+
+	statePath := s.StatePath
+	if runtime.GOOS == "windows" {
+		var err error
+		statePath, err = translateToWSLPath(s.StatePath)
+		if err != nil {
+			return "", "", -1, fmt.Errorf("failed to translate StatePath to WSL: %w", err)
+		}
 	}
 
 	// We use runsc exec with the identical global rootless flags
 	runscArgs := []string{
-		"--root", s.StatePath,
+		"--root", statePath,
 		"--ignore-cgroups",
 		"--rootless",
 		"exec", s.ID,
 		"/bin/sh", "-c", command,
 	}
 
-	cmd := exec.Command(runscPath, runscArgs...)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		wslArgs := append([]string{"-d", WSLDistro, "runsc"}, runscArgs...)
+		cmd = exec.Command("wsl", wslArgs...)
+	} else {
+		cmd = exec.Command(runscPath, runscArgs...)
+	}
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
-	err = cmd.Run()
+	err := cmd.Run()
 	stdout := stdoutBuf.String()
 	stderr := stderrBuf.String()
 
@@ -531,5 +641,28 @@ func LoadPersistentSessions(rootfsMgr *RootfsManager) ([]*Sandbox, error) {
 		}
 	}
 	return loaded, nil
+}
+
+func translateToWSLPath(winPath string) (string, error) {
+	if runtime.GOOS != "windows" {
+		return winPath, nil
+	}
+	cmd := exec.Command("wsl", "wslpath", "-u", winPath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return fallbackWinToWSLPath(winPath), nil
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+func fallbackWinToWSLPath(winPath string) string {
+	if len(winPath) >= 3 && winPath[1] == ':' && (winPath[2] == '\\' || winPath[2] == '/') {
+		drive := strings.ToLower(string(winPath[0]))
+		tail := strings.ReplaceAll(winPath[3:], "\\", "/")
+		return "/mnt/" + drive + "/" + tail
+	}
+	return strings.ReplaceAll(winPath, "\\", "/")
 }
 
