@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 type NetworkMode string
@@ -33,6 +34,7 @@ type Sandbox struct {
 	NetMode      NetworkMode
 	TemplateName string
 	Persist      bool
+	AutoStart    bool
 }
 
 // NewSandbox initializes a new sandboxed environment with a unique ID and bootstrapped rootfs
@@ -216,10 +218,7 @@ func (s *Sandbox) Run(args []string, isTerminal bool, netMode NetworkMode) error
 
 	if runtime.GOOS == "windows" {
 		var err error
-		statePath, err = translateToWSLPath(s.StatePath)
-		if err != nil {
-			return fmt.Errorf("failed to translate StatePath to WSL: %w", err)
-		}
+		statePath = "/tmp/" + s.ID + "-state"
 		bundlePath, err = translateToWSLPath(s.BundlePath)
 		if err != nil {
 			return fmt.Errorf("failed to translate BundlePath to WSL: %w", err)
@@ -316,6 +315,35 @@ func (s *Sandbox) Cleanup() {
 	}
 }
 
+// SaveMetadata writes the current configuration settings (meta.json) to the session directory if persistent.
+func (s *Sandbox) SaveMetadata() error {
+	if !s.Persist {
+		return nil
+	}
+	meta := struct {
+		ID           string      `json:"id"`
+		Persist      bool        `json:"persist"`
+		TemplateName string      `json:"template_name"`
+		NetMode      NetworkMode `json:"net_mode"`
+		AutoStart    bool        `json:"auto_start"`
+	}{
+		ID:           s.ID,
+		Persist:      true,
+		TemplateName: s.TemplateName,
+		NetMode:      s.NetMode,
+		AutoStart:    s.AutoStart,
+	}
+	metaData, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	sessionDir := filepath.Dir(s.RootfsPath)
+	if err := os.MkdirAll(sessionDir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(sessionDir, "meta.json"), metaData, 0644)
+}
+
 // StartDaemon starts a persistent, long-running sandbox session in the background
 func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 	if netMode == NetworkDefault {
@@ -323,20 +351,8 @@ func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 	}
 	s.NetMode = netMode
 
-	if s.Persist {
-		meta := struct {
-			ID           string      `json:"id"`
-			Persist      bool        `json:"persist"`
-			TemplateName string      `json:"template_name"`
-			NetMode      NetworkMode `json:"net_mode"`
-		}{
-			ID:           s.ID,
-			Persist:      true,
-			TemplateName: s.TemplateName,
-			NetMode:      netMode,
-		}
-		metaData, _ := json.MarshalIndent(meta, "", "  ")
-		_ = os.WriteFile(filepath.Join(filepath.Dir(s.RootfsPath), "meta.json"), metaData, 0644)
+	if err := s.SaveMetadata(); err != nil {
+		return fmt.Errorf("saving metadata: %w", err)
 	}
 
 	runscPath := "runsc"
@@ -364,10 +380,7 @@ func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 
 	if runtime.GOOS == "windows" {
 		var err error
-		statePath, err = translateToWSLPath(s.StatePath)
-		if err != nil {
-			return fmt.Errorf("failed to translate StatePath to WSL: %w", err)
-		}
+		statePath = "/tmp/" + s.ID + "-state"
 		bundlePath, err = translateToWSLPath(s.BundlePath)
 		if err != nil {
 			return fmt.Errorf("failed to translate BundlePath to WSL: %w", err)
@@ -418,6 +431,15 @@ func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 
 	runscArgs = append(runscArgs, "run", "--bundle", bundlePath, s.ID)
 
+	// Force-delete any leftover container registration from previous ungraceful shutdowns
+	if runtime.GOOS == "windows" {
+		delCmd := exec.Command("wsl", "-d", WSLDistro, "runsc", "--root", statePath, "delete", "-force", s.ID)
+		_ = delCmd.Run()
+	} else {
+		delCmd := exec.Command(runscPath, "--root", statePath, "delete", "-force", s.ID)
+		_ = delCmd.Run()
+	}
+
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		wslArgs := append([]string{"-d", WSLDistro, "runsc"}, runscArgs...)
@@ -448,6 +470,15 @@ func (s *Sandbox) StartDaemon(netMode NetworkMode) error {
 
 // Exec injects and runs a command inside the running sandbox daemon, returning stdout, stderr, and the exit code
 func (s *Sandbox) Exec(command string) (string, string, int, error) {
+	// Start the daemon on-demand if it is not currently running
+	if s.Cmd == nil || s.Cmd.Process == nil {
+		if err := s.StartDaemon(s.NetMode); err != nil {
+			return "", "", -1, fmt.Errorf("starting sandbox daemon on-demand: %w", err)
+		}
+		// Give the daemon a moment to boot and configure before running exec commands
+		time.Sleep(1 * time.Second)
+	}
+
 	runscPath := "runsc"
 	if runtime.GOOS == "windows" {
 		_, err := exec.LookPath("wsl")
@@ -465,11 +496,7 @@ func (s *Sandbox) Exec(command string) (string, string, int, error) {
 
 	statePath := s.StatePath
 	if runtime.GOOS == "windows" {
-		var err error
-		statePath, err = translateToWSLPath(s.StatePath)
-		if err != nil {
-			return "", "", -1, fmt.Errorf("failed to translate StatePath to WSL: %w", err)
-		}
+		statePath = "/tmp/" + s.ID + "-state"
 	}
 
 	// We use runsc exec with the identical global rootless flags
@@ -532,6 +559,11 @@ func (s *Sandbox) Close() error {
 		_ = s.Cmd.Wait()
 	}
 	s.Cleanup()
+	if runtime.GOOS == "windows" {
+		// Clean up the state folder inside WSL
+		cleanupCmd := exec.Command("wsl", "-d", WSLDistro, "rm", "-rf", "/tmp/"+s.ID+"-state")
+		_ = cleanupCmd.Run()
+	}
 	if !s.Persist && s.ID != "default-sandbox" {
 		// Clean up the entire session folder for ephemeral custom sandboxes
 		sessionDir := filepath.Dir(s.RootfsPath)
@@ -627,6 +659,7 @@ func LoadPersistentSessions(rootfsMgr *RootfsManager) ([]*Sandbox, error) {
 			Persist      bool        `json:"persist"`
 			TemplateName string      `json:"template_name"`
 			NetMode      NetworkMode `json:"net_mode"`
+			AutoStart    bool        `json:"auto_start"`
 		}
 		if err := json.Unmarshal(data, &meta); err != nil {
 			continue
@@ -636,6 +669,7 @@ func LoadPersistentSessions(rootfsMgr *RootfsManager) ([]*Sandbox, error) {
 			sb, err := NewSessionSandbox(rootfsMgr, sessionID, meta.TemplateName, true)
 			if err == nil {
 				sb.NetMode = meta.NetMode
+				sb.AutoStart = meta.AutoStart
 				loaded = append(loaded, sb)
 			}
 		}
@@ -647,6 +681,8 @@ func translateToWSLPath(winPath string) (string, error) {
 	if runtime.GOOS != "windows" {
 		return winPath, nil
 	}
+	// Convert backslashes to forward slashes to prevent shell escaping issues in WSL command line execution
+	winPath = filepath.ToSlash(winPath)
 	cmd := exec.Command("wsl", "wslpath", "-u", winPath)
 	var out bytes.Buffer
 	cmd.Stdout = &out

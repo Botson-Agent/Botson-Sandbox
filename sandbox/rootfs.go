@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -104,6 +105,24 @@ func (rm *RootfsManager) downloadFile(filepath string, url string) error {
 }
 
 func (rm *RootfsManager) unpackTarGz(tarPath string, destDir string) error {
+	if runtime.GOOS == "windows" {
+		wslTar, err := translateToWSLPath(tarPath)
+		if err != nil {
+			return fmt.Errorf("translating tar path to WSL: %w", err)
+		}
+		wslDest, err := translateToWSLPath(destDir)
+		if err != nil {
+			return fmt.Errorf("translating dest path to WSL: %w", err)
+		}
+
+		// Run tar extraction inside WSL to properly handle symlinks on NTFS mounts
+		cmd := exec.Command("wsl", "-d", WSLDistro, "tar", "-xzf", wslTar, "-C", wslDest)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("WSL tar extraction failed: %w (output: %s)", err, string(out))
+		}
+		return nil
+	}
+
 	file, err := os.Open(tarPath)
 	if err != nil {
 		return err
@@ -173,6 +192,28 @@ func (rm *RootfsManager) unpackTarGz(tarPath string, destDir string) error {
 
 // copyDirRecursive recursively copies a directory tree, preserving files, directories, modes, and symlinks.
 func (rm *RootfsManager) copyDirRecursive(src, dst string) error {
+	if runtime.GOOS == "windows" {
+		wslSrc, err := translateToWSLPath(src)
+		if err != nil {
+			return fmt.Errorf("translating source path to WSL: %w", err)
+		}
+		wslDst, err := translateToWSLPath(dst)
+		if err != nil {
+			return fmt.Errorf("translating dest path to WSL: %w", err)
+		}
+
+		// Run cp inside WSL to preserve symlinks and avoid Windows symlink creation permissions issues.
+		// Note that on NTFS mounts, cp -a will print ownership warnings, but it copies all files and symlinks correctly.
+		cmd := exec.Command("wsl", "-d", WSLDistro, "cp", "-a", wslSrc+"/.", wslDst+"/")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// Check if copying actually succeeded by verifying the destination isn't empty
+			if _, statErr := os.Stat(filepath.Join(dst, "bin")); statErr != nil {
+				return fmt.Errorf("WSL copy failed: %w (output: %s)", err, string(out))
+			}
+		}
+		return nil
+	}
+
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		return err
